@@ -1,6 +1,6 @@
 /**
  * UI-Router Extras: Sticky states, Future States, Deep State Redirect, Transition promise
- * @version v0.0.11
+ * @version v0.0.12-pre1
  * @link http://christopherthielen.github.io/ui-router-extras/
  * @license MIT License, http://www.opensource.org/licenses/MIT
  */
@@ -74,6 +74,21 @@ function objectKeys(object) {
   angular.forEach(object, function (val, key) {
     result.push(key);
   });
+  return result;
+}
+
+/**
+ * like objectKeys, but includes keys from prototype chain.
+ * @param object the object whose prototypal keys will be returned
+ * @param ignoreKeys an array of keys to ignore
+ */
+// Duplicates code in UI-Router common.js
+function protoKeys(object, ignoreKeys) {
+  var result = [];
+  for (var key in object) {
+    if (!ignoreKeys || ignoreKeys.indexOf(key) === -1)
+      result.push(key);
+  }
   return result;
 }
 
@@ -243,14 +258,20 @@ angular.module("ct.ui.router.extras").service("$deepStateRedirect", [ '$rootScop
   });
 
   return {
-    reset: function(stateOrName) {
+    reset: function(stateOrName, params) {
       if (!stateOrName) {
         angular.forEach(lastSubstate, function(redirect, dsrState) { lastSubstate[dsrState] = {}; });
       } else {
         var state = $state.get(stateOrName);
         if (!state) throw new Error("Unknown state: " + stateOrName);
-        if (lastSubstate[state.name])
-          lastSubstate[state.name] = {};
+        if (lastSubstate[state.name]) {
+          if (params) {
+            var key = getParamsString(params, getConfig(state).params);
+            delete lastSubstate[state.name][key];
+          } else {
+            lastSubstate[state.name] = {};
+          }
+        }
       }
     }
   };
@@ -351,6 +372,9 @@ function $StickyStateProvider($stateProvider) {
 
       // Duplicates logic in $state.transitionTo, primarily to find the pivot state (i.e., the "keep" value)
       function equalForKeys(a, b, keys) {
+        if (angular.isObject(keys)) {
+          keys = protoKeys(keys, ["$$keys", "$$values", "$$equals", "$$validates"]);
+        }
         if (!keys) {
           keys = [];
           for (var n in a) keys.push(n); // Used instead of Object.keys() for IE8 compatibility
@@ -1021,7 +1045,7 @@ angular.module('ct.ui.router.extras').provider('$futureState',
   [ '$stateProvider', '$urlRouterProvider', '$urlMatcherFactoryProvider',
     function _futureStateProvider($stateProvider, $urlRouterProvider, $urlMatcherFactory) {
       var stateFactories = {}, futureStates = {};
-      var transitionPending = false, resolveFunctions = [], initPromise, initDone = false;
+      var lazyloadInProgress = false, resolveFunctions = [], initPromise, initDone = false;
       var provider = this;
 
       // This function registers a promiseFn, to be resolved before the url/state matching code
@@ -1067,7 +1091,7 @@ angular.module('ct.ui.router.extras').provider('$futureState',
         var parentMatcher,  parentName = futureState.name.split(/\./).slice(0, -1).join("."),
           realParent = findState(futureState.parent || parentName);
         if (realParent) {
-          parentMatcher = realParent.navigable.url;
+          parentMatcher = realParent.url || realParent.navigable.url;
         } else if (parentName === "") {
           parentMatcher = $urlMatcherFactory.compile("");
         } else {
@@ -1126,6 +1150,7 @@ angular.module('ct.ui.router.extras').provider('$futureState',
       }
 
       function lazyLoadState($injector, futureState) {
+        lazyloadInProgress = true;
         var $q = $injector.get("$q");
         if (!futureState) {
           var deferred = $q.defer();
@@ -1181,23 +1206,22 @@ angular.module('ct.ui.router.extras').provider('$futureState',
                 return $injector.invoke(otherwiseFunc);
               }
 
-              transitionPending = true;
               // Config loaded.  Asynchronously lazy-load state definition from URL fragment, if mapped.
               lazyLoadState($injector, futureState).then(function lazyLoadedStateCallback(states) {
                 states.forEach(function (state) {
                   if (state && (!$state.get(state) || (state.name && !$state.get(state.name))))
                     $stateProvider.state(state);
                 });
+                lazyloadInProgress = false;
                 resyncing = true;
                 $urlRouter.sync();
                 resyncing = false;
-                transitionPending = false;
               }, function lazyLoadStateAborted() {
-                transitionPending = false;
+                lazyloadInProgress = false;
                 return $injector.invoke(otherwiseFunc);
               });
             }];
-        if (transitionPending) return;
+        if (lazyloadInProgress) return;
 
         var nextFn = resyncing ? otherwiseFunc : lazyLoadMissingState;
         return $injector.invoke(nextFn);
@@ -1211,7 +1235,7 @@ angular.module('ct.ui.router.extras').provider('$futureState',
           rule = function () { return redirect; };
         }
         else if (!angular.isFunction(rule)) throw new Error("'rule' must be a function");
-        otherwiseFunc = rule;
+        otherwiseFunc = ['$injector', '$location', rule];
         return $urlRouterProvider;
       }; 
 
@@ -1226,15 +1250,13 @@ angular.module('ct.ui.router.extras').provider('$futureState',
         function futureStateProvider_get($injector, $state, $q, $rootScope, $urlRouter, $timeout, $log) {
           function init() {
             $rootScope.$on("$stateNotFound", function futureState_notFound(event, unfoundState, fromState, fromParams) {
-              if (transitionPending) return;
+              if (lazyloadInProgress) return;
               $log.debug("event, unfoundState, fromState, fromParams", event, unfoundState, fromState, fromParams);
 
               var futureState = findFutureState($state, { name: unfoundState.to });
               if (!futureState) return;
 
               event.preventDefault();
-              transitionPending = true;
-
               var promise = lazyLoadState($injector, futureState);
               promise.then(function (states) {
                 states.forEach(function (state) {
@@ -1242,11 +1264,11 @@ angular.module('ct.ui.router.extras').provider('$futureState',
                     $stateProvider.state(state);
                 });
                 $state.go(unfoundState.to, unfoundState.toParams);
-                transitionPending = false;
+                lazyloadInProgress = false;
               }, function (error) {
                 console.log("failed to lazy load state ", error);
                 $state.go(fromState, fromParams);
-                transitionPending = false;
+                lazyloadInProgress = false;
               });
             });
 
